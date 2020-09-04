@@ -160,6 +160,10 @@ DECL_PASS_BEFORE_COPY(UnrollTI);
 DECL_PASS_BEFORE_COPY(RemoveConst);
 
 /**
+*/
+DECL_PASS_BEFORE_COPY(RemoveSingleInputConcat);
+
+/**
  * @brief removed extra identity layer for multi-output
  */
 DECL_PASS(FuseMultipleIdentities);

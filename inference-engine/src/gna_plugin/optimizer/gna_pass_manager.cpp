@@ -23,6 +23,7 @@
 #include <legacy/ie_util_internal.hpp>
 #include <legacy/graph_tools.hpp>
 #include <legacy/net_pass.h>
+#include <layers/gna_copy_layer.hpp>
 
 #include "gna_plugin_log.hpp"
 #include "frontend/quantized_layer_params.hpp"
@@ -94,12 +95,13 @@ static void insertDiagonalLayerBetween(InferenceEngine::CNNLayerPtr prevLayer,
  * @brief copy layer inserted by several passes
  * @returns pointer to newly created COPYLayer
  */
-static CNNLayerPtr InsertCopyLayer(CNNLayerPtr prevLayer, CNNLayerPtr nextLayer, int beforeIdx, std::shared_ptr<IPassManager> passmanager) {
+static CNNLayerPtr InsertCopyLayer(CNNLayerPtr prevLayer, CNNLayerPtr nextLayer, int beforeIdx,
+                                   std::shared_ptr<IPassManager> passmanager,  std::string copyLayerType) {
     auto quantized = InferenceEngine::getInjectedData<QuantizedLayerParams>(prevLayer);
-    std::string copyName = std::string("copy_") + std::to_string(passmanager->getIntVar(copyLayersCounter)++);
+    std::string copyName = copyLayerType + std::string("_") + std::to_string(passmanager->getIntVar(copyLayersCounter)++);
     gnalog() << "Inserted " << copyName << " between: " << prevLayer->name << " and " << nextLayer->name << std::endl;
 
-    CNNLayerPtr copyLayer = std::make_shared<GenericLayer>(LayerParams({copyName, "Copy", Precision::FP32}));
+    CNNLayerPtr copyLayer = std::make_shared<GenericLayer>(LayerParams({copyName, copyLayerType, Precision::FP32}));
 
     auto inputData = nextLayer->insData[beforeIdx].lock();
     auto dataPtr = std::make_shared<Data>(copyName, inputData->getTensorDesc());
@@ -128,7 +130,6 @@ static std::vector<CNNLayerPtr> getCandidatesForIdentityInsertion(const CNNLayer
         gnalog() << "CNNNetPrevLayerSkipCertain for :: " << l->name << "returned: " << prevLayer->name << std::endl;
         return prevLayer;
     };
-
 
     // eltwise
     if (eltwise != nullptr) {
@@ -185,19 +186,92 @@ static std::vector<CNNLayerPtr> getCandidatesForIdentityInsertion(const CNNLayer
                 prevLayers.push_back(CNNNetPrevLayer(l, i));
             }
         }
+    } else if (LayerInfo(l).isOutput() && (LayerInfo(l).isPooling() || LayerInfo(l).isNonFunctional()))  {
+        if (LayerInfo(l).isPooling()) {
+            // in GNA pooling get executed on 2 bytes data, that is why preceding activation required
+            // in gna - primitive fusing we however fuse different order conv->pool->act
+            prevLayers.push_back(l);
+        }
+        if (LayerInfo(l).isNonFunctional()) {
+            // for output layers even if it is non functional it might have limitations
+            // gna cannot have 32bits precision for pooling layer output
+            auto prev = PrevFunctionalLayer(l, 0);
+            if (LayerInfo(prev).isPooling()) {
+                prevLayers.push_back(prev);
+            }
+        }
     } else {
         // not eltwise or concat
         // other layers has 1 inputs - situation is easier
-        // ex. activation or pooling - no need to insert identity activation.
+        // ex. activation  - no need to insert identity activation.
         if (LayerInfo(l).isNonFunctional() || LayerInfo(l).has32BInput())
             return prevLayers;
 
-        auto prevLayer = PrevFunctionalLayer(l, 0);
+        gnalog() << "CNNNetPrevLayer skip non functional from :: " << l->name;
+        auto isFunctional = [](CNNLayerPtr ptr) {
+            return !LayerInfo(ptr).isNonFunctional();
+        };
+        auto isNonFunctional = [](CNNLayerPtr ptr) {
+            return LayerInfo(ptr).isNonFunctional();
+        };
+
+        auto prevLayersReached = CNNNetGetPrevLayersSkip(l, isFunctional);
+
+        prevLayersReached.erase(std::remove_if(prevLayersReached.begin(),
+            prevLayersReached.end(),
+            [] (const std::pair<CNNLayerPtr, int> & candidate) {
+                return LayerInfo(candidate.first).isLink();
+            }), prevLayersReached.end());
+        if (prevLayersReached.size() != 1) {
+            std::stringstream layers;
+            for (auto && prevLayer : prevLayersReached) {
+                layers << prevLayer.first->name;
+                layers << ", ";
+            }
+            THROW_GNA_LAYER_EXCEPTION(l) << "unsupported case: connected to "
+                << (prevLayersReached.empty() ? "zero" : "multiple") << " outputs : " << layers.str();
+        }
+        auto prevLayer = prevLayersReached.front().first;
+        auto outDataIdx = prevLayersReached.front().second;
+        gnalog() << ", reached " << prevLayer->name << " at " << outDataIdx << std::endl;
 
         if (!LayerInfo(prevLayer).has32BOutput())
             return prevLayers;
 
-        prevLayers.push_back(CNNNetPrevLayer(l, 0));
+        // identity might be already attached to same  layer output but hidden by non functional childs
+        // start iterating all connections
+
+        std::vector<CNNLayerPtr> resultSet = CNNNetGetAllNextLayersSkipCertain(prevLayer, outDataIdx, isNonFunctional);
+
+        // now result set should have all needed layers
+        // checking that result set consist of identity already
+        CNNLayerPtr  alreadyIdentity;
+        for (auto &&res : resultSet) {
+            if (LayerInfo(res).isIdentity()) {
+                alreadyIdentity = res;
+                break;
+            }
+        }
+        if (!alreadyIdentity) {
+            prevLayers.push_back(CNNNetPrevLayer(l, 0));
+        } else {
+            // just figure out how to connect to that identity already
+            // 1nd stage - disconnect given layer from previous
+            auto directPrev = getCreatorLayer(l->insData.front().lock()).lock();
+            auto oDataIdx = CNNLayerFindOutDataIdx(directPrev, 0);
+            auto &inputTo = getInputTo(directPrev->outData[oDataIdx]);
+            for (auto inIterator = inputTo.begin(); inIterator != inputTo.end(); inIterator++) {
+                if (inIterator->second == l) {
+                    inputTo.erase(inIterator);
+                    break;
+                }
+            }
+            l->insData.clear();
+
+            // now setting up new connection
+            l->insData.push_back(alreadyIdentity->outData.front());
+            getInputTo(alreadyIdentity->outData.front())[l->name] = l;
+        }
     }
     return prevLayers;
 }
@@ -689,27 +763,34 @@ void InsertCopyLayerPass::run() {
         for (int i=0; i != prevLayers.size(); i++) {
             auto & prevIndirectLayer = prevLayers[i].first;
             bool bInsert = false;
+            /// Delayed copy layers need to be moved to the very end of processing
+            bool bInsertDelayed = false;
+
+            auto isInserted = [&bInsertDelayed, &bInsert]() {
+                return bInsert || bInsertDelayed;
+            };
+
             if (LayerInfo(l).isMemory()) {
-                if (LayerInfo(prevIndirectLayer).isConcat()) { bInsert = true;}
+                if (LayerInfo(prevIndirectLayer).isConcat() || LayerInfo(prevIndirectLayer).isCrop()) { bInsertDelayed = true;}
                 // memory usualy preceded by either activation or split, or other layers in order to have 2b precision
                 for (auto && inputto : getInputTo(prevLayers[i].first->outData[prevLayers[i].second])) {
                     // if preceding layer is common for memory and concat
                     if (LayerInfo(inputto.second).isConcat()) {
-                        bInsert = true;
+                        bInsertDelayed = true;
                         break;
                     }
                 }
             }
-            if (LayerInfo(l).isConcat() && LayerInfo(prevIndirectLayer).isCrop()) { bInsert = true; }
+            if (!isInserted() && LayerInfo(l).isConcat() && LayerInfo(prevIndirectLayer).isCrop()) { bInsert = true; }
 
-            if (bInsert) {
+            if (isInserted()) {
                 if (LayerInfo(prevIndirectLayer).isCropAffined()) {
                     // The crop will be replaced by affine.
                     // Copy layer insertion is not required
                     continue;
                 }
                 auto prevLayer = CNNNetPrevLayer(l, i);
-                InsertCopyLayer(prevLayer, l, i, getPassManager());
+                InsertCopyLayer(prevLayer, l, i, getPassManager(), bInsertDelayed ? DelayedCopyLayerName : CopyLayerName);
             }
         }
     }
@@ -1280,6 +1361,33 @@ void RemoveConstPass::run() {
     }
     ConstTransformer transformer(implNetwork);
     transformer.fullTrim();
+}
+
+void RemoveSingleInputConcatPass::run() {
+    for (auto &l : *pLayers) {
+        if (l->type == "Concat") {
+            auto concat = dynamic_cast<ConcatLayer*>(l.get());
+            if (concat->insData.size() == 1 && concat->outData.size() > 0) {
+                auto in = concat->insData[0];
+                auto in_layer = getCreatorLayer(in.lock());
+
+                auto out = concat->outData[0];
+
+                for (auto out_layer : getInputTo(out)) {
+                    for (int i = 0; i < out_layer.second->insData.size(); i++) {
+                        if (out_layer.second->insData[i].lock() == out) {
+                            out_layer.second->insData[i] = in;
+                            getInputTo(in.lock())[out_layer.second->name] = out_layer.second;
+                        }
+                    }
+                }
+                getInputTo(in.lock()).erase(concat->name);
+                getInputTo(out).clear();
+                concat->insData.clear();
+                concat->outData.clear();
+            }
+        }
+    }
 }
 
 void FuseMultipleIdentitiesPass::run() {
