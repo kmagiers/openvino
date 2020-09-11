@@ -48,6 +48,7 @@ std::shared_ptr<IPassManager> BasePass::getPassManager() {
 }
 
 // indexes stored in pass manager
+static const char identityLayersCounterName[] = "identityLayerCounter";
 static const char diagonalLayersCounterName[] = "diagonalLayerCounter";
 static const char copyLayersCounter[] = "numCopyLayers";
 static const char softSignLayersCounter[] = "numSoftSignLayers";
@@ -695,12 +696,13 @@ void RemovePermutationsNHWCToNCHWPass::run() {
 }
 
 void InsertIdentityLayerPass::run() {
-    int numOfIdentityLayers = 0;
+    
     auto quantized = InferenceEngine::getInjectedData<QuantizedLayerParams>(pLayers->front());
     for (auto & l : *pLayers) {
         for (auto && prev : getCandidatesForIdentityInsertion(l)) {
+            int numOfIdentityLayers = this->getPassManager()->getIntVar(identityLayersCounterName)++;
             // actual insertion
-            auto activationName = std::string("identity_") + std::to_string(++numOfIdentityLayers);
+            auto activationName = std::string("identity_") + std::to_string(numOfIdentityLayers);
 
             gnalog() << "Inserted "<< activationName << " between: " << prev->name << " and " << l->name << "\n" << std::flush;
 
@@ -1327,6 +1329,50 @@ void BroadcastConstPass::run() {
         constLayer->outData.front()->setDims(nextLayer->outData.front()->getDims());
         constLayer->outData.front()->setLayout(nextLayer->outData.front()->getLayout());
         gnalog() << "Const layer '" << constLayer->name << "' was changed to match output of '" << nextLayer->name << "'\n";
+    }
+}
+
+void InsertIdentityToLSTMCellPass::run() {
+    
+    for (auto layer : *pLayers) {
+        if (layer->type == "LSTMCell") {
+            // This fixed the cases when both functional and non-functional outputs are mixed (or not outputs are used)
+            // which results in scratch buffer being used so outputs cannot be used in form of blob or by non-functional layers
+            // downside is scaling down from i32 to i16 which may
+            for(int output_idx = 0; output_idx < layer->outData.size(); output_idx++) {
+                int numOfIdentityLayers = ((this->getPassManager())->getIntVar(identityLayersCounterName))++;
+                auto activationName = std::string("lstm_identity_") + std::to_string(numOfIdentityLayers);
+                auto& output = layer->outData[output_idx];
+                auto& input_to = getInputTo(output);
+
+
+                CNNLayerPtr activationLayer =
+                    std::make_shared<GenericLayer>(LayerParams({activationName, "identity", InferenceEngine::Precision::FP32}));
+
+                auto dataPtr = std::make_shared<Data>("lstm_identity_data_" + std::to_string(numOfIdentityLayers), output->getTensorDesc());
+                
+                auto quantized = InferenceEngine::getInjectedData<QuantizedLayerParams>(layer);
+                auto activationLayerWithQuant = quantized ? InferenceEngine::injectData<QuantizedLayerParams>(activationLayer) : activationLayer;
+                getCreatorLayer(dataPtr) = activationLayerWithQuant;
+                activationLayerWithQuant->outData.push_back(dataPtr);
+                activationLayerWithQuant->insData.push_back(output);
+                auto& activationInputTo = getInputTo(dataPtr);
+                
+                for(auto& input : input_to) {
+                    auto& next_layer = input.second;
+                    activationInputTo[input.first] = next_layer;
+                    for(int i = next_layer->insData.size() -1; i>= 0; i--) {
+                        auto& ins = next_layer->insData[i].lock();
+                        if(ins == output) {
+                            next_layer->insData.erase(next_layer->insData.begin() + i);
+                        }
+                    }
+                    next_layer->insData.push_back(dataPtr);
+                }
+                input_to.clear();
+                input_to[activationName] = activationLayerWithQuant;
+            }
+        }
     }
 }
 

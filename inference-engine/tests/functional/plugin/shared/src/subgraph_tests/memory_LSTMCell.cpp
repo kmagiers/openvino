@@ -62,7 +62,7 @@ namespace SubgraphTestsDefinitions {
 
         input_bias.resize(inputSize);
         for (auto& val : input_bias) {
-            val = (static_cast<float>(rand() % max_val) / divider - pad) * 40;
+            val = (static_cast<float>(rand() % max_val) / divider - pad);
         }
         input_weights.resize(inputSize);
         for (auto& val : input_weights) {
@@ -70,19 +70,19 @@ namespace SubgraphTestsDefinitions {
         }
         hidden_memory_init.resize(hiddenSize);
         for (auto& val : hidden_memory_init) {
-            val = 0;//static_cast<float>(rand() % max_val) / divider - pad;
+            val = static_cast<float>(rand() % max_val) / divider - pad;
         }
         cell_memory_init.resize(hiddenSize);
         for (auto& val : cell_memory_init) {
-            val = 0;//static_cast<float>(rand() % max_val) / divider - pad;
+            val = static_cast<float>(rand() % max_val) / divider - pad;
         }
         weights_vals.resize(4 * hiddenSize * inputSize);
         for (auto& val : weights_vals) {
-            val = (static_cast<float>(rand() % max_val) / divider - pad) * 30;
+            val = (static_cast<float>(rand() % max_val) / divider - pad);
         }
         reccurrenceWeights_vals.resize(4 * hiddenSize * hiddenSize);
         for (auto& val : reccurrenceWeights_vals) {
-            val = (static_cast<float>(rand() % max_val) / divider - pad) * 30;
+            val = (static_cast<float>(rand() % max_val) / divider - pad);
         }
         bias_vals.resize(4 * hiddenSize);
         for (auto& val : bias_vals) {
@@ -210,7 +210,7 @@ namespace SubgraphTestsDefinitions {
 
         ConfigurePlugin();
         LoadNetwork();
-        /*auto& states = executableNetwork.QueryState();
+        auto& states = executableNetwork.QueryState();
         for(auto& state: states) {
             auto name = state.GetName();
             if(name == "cell_memory") {
@@ -222,20 +222,8 @@ namespace SubgraphTestsDefinitions {
             } else {
                 GTEST_FAIL() << "unknown memory state";
             }
-        }*/
-        Infer();
-        auto& states = executableNetwork.QueryState();
-        for(auto& state: states) {
-            auto last_state = state.GetLastState();
-            auto ptr = last_state->cbuffer().as<float*>();
-            std::vector<float> state_vals(ptr, ptr + hiddenSize);
-
         }
-        auto last_state = states[0].GetLastState();
-        auto ptr = last_state->cbuffer().as<float*>();
-        auto output_ptr = GetOutputs()[0]->buffer().as<float*>();
-        std::memcpy(output_ptr,ptr, hiddenSize * sizeof(float));
-
+        Infer();
         switchToNgraphFriendlyModel();
         Validate();
     }

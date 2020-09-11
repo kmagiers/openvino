@@ -4,10 +4,18 @@
 namespace SubgraphTestsDefinitions {
     std::vector<size_t> input_sizes = {
         80,
+        32,
+        64,
+        100,
+        25
     };
 
     std::vector<size_t> hidden_sizes = {
         128,
+        200,
+        300,
+        24,
+        32,
     };
 
     std::map<std::string, std::string> additional_config = {
